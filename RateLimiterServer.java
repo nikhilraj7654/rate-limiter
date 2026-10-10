@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 public class RateLimiterServer {
 
     static final int CAPACITY = 5;
-    static final long REFILL_MS = 2000;
+    static final long REFILL_MS = 10000;
 
     static final String PAGE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8">
