@@ -294,3 +294,75 @@ render();
                 ip = ex.getRemoteAddress().getAddress().getHostAddress();
             }
             String browser = ex.getRequestHeaders().getFirst("User-Agent");
+
+            // Ask the token bucket
+            TokenBucketRateLimiter.Result r = limiter.tryAcquire(id);
+            int code = r.allowed() ? 200 : 429;
+
+            // Save this request in the client's record
+            Client c = clients.computeIfAbsent(id, k -> new Client());
+            synchronized (c) {
+                if (r.allowed()) c.allowed++; else c.blocked++;
+                c.lastRequest = System.currentTimeMillis();
+                c.ip = ip;
+                c.browser = browser == null ? "-" : browser;
+                c.remaining = String.valueOf(r.remaining());
+
+                c.history.addFirst("{\"time\":" + c.lastRequest
+                        + ",\"status\":" + code
+                        + ",\"remaining\":" + c.remaining + "}");
+                if (c.history.size() > 10) c.history.removeLast();
+            }
+
+            // Build the JSON response
+            String message = r.allowed()
+                    ? "Request allowed"
+                    : "Too many requests. Wait " + r.waitMs() / 1000.0 + " seconds";
+
+            String body = "{"
+                    + "\"allowed\":" + r.allowed() + ","
+                    + "\"remaining\":" + r.remaining() + ","
+                    + "\"retryAfterMs\":" + r.waitMs() + ","
+                    + "\"message\":\"" + message + "\""
+                    + "}";
+
+            send(ex, code, "application/json; charset=UTF-8", body);
+        });
+
+        // API 2: client details (does NOT use a token)
+        server.createContext("/details", ex -> {
+            String id = getId(ex);
+            Client c = clients.get(id);
+
+            if (c == null) {
+                send(ex, 404, "application/json; charset=UTF-8", "{\"message\":\"Client not found\"}");
+                return;
+            }
+
+            String body;
+            synchronized (c) {
+                body = "{"
+                        + "\"clientId\":\"" + id + "\","
+                        + "\"limit\":" + CAPACITY + ","
+                        + "\"refillSeconds\":" + (REFILL_MS / 1000) + ","
+                        + "\"remaining\":" + c.remaining + ","
+                        + "\"total\":" + (c.allowed + c.blocked) + ","
+                        + "\"allowed\":" + c.allowed + ","
+                        + "\"blocked\":" + c.blocked + ","
+                        + "\"ip\":\"" + clean(c.ip) + "\","
+                        + "\"userAgent\":\"" + clean(c.browser) + "\","
+                        + "\"firstSeen\":" + c.firstSeen + ","
+                        + "\"lastRequest\":" + c.lastRequest + ","
+                        + "\"history\":[" + String.join(",", c.history) + "]"
+                        + "}";
+            }
+
+            send(ex, 200, "application/json; charset=UTF-8", body);
+        });
+
+        // Handle many users at the same time
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+        server.start();
+        System.out.println("Running on port " + port);
+    }
+}
