@@ -3,7 +3,6 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.Executors;
 
 public class RateLimiterServer {
 
@@ -11,141 +10,238 @@ public class RateLimiterServer {
     static final long REFILL_MS = 30000;
 
     static final String PAGE = """
-<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Rate Limiter</title>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rate Limiter</title>
 <style>
-body{font-family:Arial;max-width:680px;margin:30px auto;padding:0 16px}
-#users{display:flex;gap:10px;margin:14px 0}
-.card{flex:1;border:2px solid #ccc;border-radius:10px;padding:10px;cursor:pointer}
-.card.on{border-color:#2b6cb0;background:#f0f6ff}
-.bx{font-size:22px;letter-spacing:3px;margin:6px 0}
-.ok{color:#11743a}.no{color:#b42318}
-button{padding:10px 16px;margin:4px 4px 4px 0;cursor:pointer}
-button:disabled{opacity:.5;cursor:not-allowed}
-#msg{padding:12px;border-radius:8px;background:#eee;margin-top:10px}
-#det{margin-top:16px;border:1px solid #ddd;border-radius:10px;padding:10px}
-td{padding:5px 4px;border-bottom:1px solid #eee;font-size:13px;word-break:break-all}
-td:first-child{width:38%;color:#555;font-weight:bold}
-</style></head><body>
+body { font-family: Arial; max-width: 600px; margin: 30px auto; padding: 0 16px; }
+#users { display: flex; gap: 10px; margin-bottom: 12px; }
+.card { flex: 1; border: 2px solid #ccc; border-radius: 10px; padding: 10px; cursor: pointer; }
+.on { border-color: #2b6cb0; background: #f0f6ff; }
+.ok { color: #11743a; }
+.no { color: #b42318; }
+button { padding: 10px 16px; }
+pre { background: #f5f5f5; padding: 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+
 <h2>Token Bucket Rate Limiter</h2>
-<p>Each user has 5 tokens. One token comes back every __SEC__ seconds. Click a user to see its details.</p>
+<p>Each user has __CAP__ tokens. One token comes back every __SEC__ seconds. Click a user to see details.</p>
+
 <div id="users"></div>
-<button id="send">Send Request</button><button id="spam">Spam 10</button>
-<div id="msg">Ready</div>
-<div id="det"><b id="dt"></b><table id="tab" width="100%"></table></div>
+<button id="send">Send Request</button>
+<button id="spam">Spam 10</button>
+<h3 id="msg"></h3>
+<pre id="details"></pre>
+
 <script>
-var CAP = __CAP__, RF = __REFILL__, act = 0, U = [];
-var sid = Date.now().toString(36);
-function $(x) { return document.getElementById(x); }
-function esc(t) { return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
-function time(t) { return t ? new Date(t).toLocaleTimeString() : "-"; }
-function cur(s) { return Math.min(CAP, s.tok + (Date.now() - s.stamp) / RF); }
+var CAP = __CAP__;
+var REFILL = __REFILL__;
+var active = 0;
+var sid = Date.now();
+var users = [];
+var cards = [];
 
+// 1. Create 3 users. Each has its own state.
 for (let i = 0; i < 3; i++) {
-  U.push({ id: "user" + (i + 1) + "-" + sid, tok: CAP, stamp: Date.now(), until: 0, ok: 0, no: 0,
-           busy: false, last: 0, code: "-", retry: "-", msg: "Ready", ip: "-", ua: "-", start: Date.now() });
-  var d = document.createElement("div");
-  d.onclick = function () { act = i; tick(); };
-  $("users").appendChild(d);
+    users.push({
+        id: "user" + (i + 1) + "-" + sid,
+        tokens: CAP,
+        time: Date.now(),
+        until: 0,
+        allowed: 0,
+        blocked: 0,
+        status: "-",
+        ip: "-",
+        browser: "-",
+        msg: "Ready",
+        busy: false
+    });
+
+    var card = document.createElement("div");
+    card.onclick = function () {
+        active = i;
+        render();
+    };
+    document.getElementById("users").appendChild(card);
+    cards.push(card);
 }
 
-function tick() {
-  var now = Date.now();
-  U.forEach(function (s, i) {
-    var t = cur(s), n = Math.floor(t + 0.001), left = s.until - now;
-    var d = $("users").children[i];
-    d.className = "card" + (i === act ? " on" : "");
-    d.innerHTML = "<b>User " + (i + 1) + "</b><div class='bx'>" + "\u25A0".repeat(n) + "\u25A1".repeat(CAP - n) +
-      "</div><b class='" + (left > 0 ? "no'>Blocked: wait " + (left / 1000).toFixed(1) + " s" : "ok'>Ready (" + t.toFixed(1) + "/" + CAP + ")") +
-      "</b><div style='font-size:12px'>Allowed " + s.ok + " | Blocked " + s.no + "</div>";
-  });
-  var a = U[act], left = a.until - now;
-  $("msg").textContent = left > 0 ? "Too many requests. Please wait " + (left / 1000).toFixed(1) + " s" : a.msg;
-  $("msg").className = left > 0 ? "no" : "";
-  $("send").disabled = $("spam").disabled = a.busy || left > 0;
-  $("dt").textContent = "Client Details: User " + (act + 1);
-  $("tab").innerHTML = [
-    ["Client ID", a.id], ["Status", left > 0 ? "Blocked (" + (left / 1000).toFixed(1) + " s left)" : "Ready"],
-    ["Tokens", cur(a).toFixed(2) + " / " + CAP], ["Refill", "1 token / " + RF / 1000 + " s"],
-    ["Total requests", a.ok + a.no], ["Last request", time(a.last)], ["Last HTTP status", a.code],
-    ["Retry after (ms)", a.retry], ["IP (seen by server)", a.ip], ["Browser (seen by server)", a.ua],
-    ["Session started", time(a.start)]
-  ].map(function (r) { return "<tr><td>" + r[0] + "</td><td>" + esc(r[1]) + "</td></tr>"; }).join("");
-}
-setInterval(tick, 200);
-
-function hit(s) {
-  return fetch("/allow?clientId=" + encodeURIComponent(s.id))
-    .then(function (x) { return x.json().then(function (d) { return [x.status, d]; }); })
-    .then(function (r) {
-      var d = r[1], now = Date.now();
-      s.stamp = s.last = now; s.code = r[0]; s.retry = d.retryAfterMs;
-      s.ip = d.ip; s.ua = d.userAgent; s.tok = d.remaining; s.msg = d.message;
-      if (d.allowed) { s.ok++; s.until = 0; s.msg = "Allowed. Remaining: " + d.remaining; }
-      else { s.no++; s.until = now + d.retryAfterMs; }
-      tick();
-      return d.allowed;
-    })
-    .catch(function () { s.msg = "Request failed. Check the server."; s.code = "failed"; tick(); return false; });
+// 2. Current tokens = last known tokens + refill since last request
+function tokens(u) {
+    var refilled = (Date.now() - u.time) / REFILL;
+    return Math.min(CAP, u.tokens + refilled);
 }
 
-$("send").onclick = function () { hit(U[act]); };
-$("spam").onclick = function () {
-  var s = U[act], n = 0;
-  s.busy = true;
-  (function next() {
-    if (n++ >= 10) { s.busy = false; return; }
-    hit(s).then(function (ok) { if (ok) setTimeout(next, 120); else s.busy = false; });
-  })();
-};
-tick();
-</script></body></html>
-""";
+// 3. Draw everything from the users array
+function render() {
+    var now = Date.now();
 
-    static void send(HttpExchange ex, int code, String type, String body) throws java.io.IOException {
-        byte[] b = body.getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", type);
-        ex.sendResponseHeaders(code, b.length);
-        try (OutputStream os = ex.getResponseBody()) { os.write(b); }
+    // cards
+    users.forEach(function (u, i) {
+        var wait = u.until - now;
+        var state = wait > 0
+            ? "<span class='no'>Blocked " + (wait / 1000).toFixed(1) + " s</span>"
+            : "<span class='ok'>Ready</span>";
+
+        cards[i].className = (i == active) ? "card on" : "card";
+        cards[i].innerHTML =
+            "<b>User " + (i + 1) + "</b><br>" +
+            "Tokens: " + Math.floor(tokens(u) + 0.001) + "/" + CAP + "<br>" +
+            state;
+    });
+
+    // message and buttons for the active user
+    var u = users[active];
+    var wait = u.until - now;
+    var disabled = u.busy || wait > 0;
+
+    document.getElementById("msg").textContent =
+        wait > 0 ? "Please wait " + (wait / 1000).toFixed(1) + " s" : u.msg;
+    document.getElementById("send").disabled = disabled;
+    document.getElementById("spam").disabled = disabled;
+
+    // details panel
+    document.getElementById("details").textContent = [
+        "Client ID: " + u.id,
+        "Tokens: " + tokens(u).toFixed(2) + " / " + CAP,
+        "Allowed: " + u.allowed + "   Blocked: " + u.blocked,
+        "Last HTTP status: " + u.status,
+        "IP (seen by server): " + u.ip,
+        "Browser (seen by server): " + u.browser
+    ].join("\\n");
+}
+
+// refresh the screen every 200 ms so countdowns stay live
+setInterval(render, 200);
+
+// 4. Call the backend for one user
+async function sendRequest(u) {
+    var res = await fetch("/allow?clientId=" + u.id);
+    var d = await res.json();
+
+    u.time = Date.now();
+    u.tokens = d.remaining;
+    u.status = res.status;
+    u.ip = d.ip;
+    u.browser = d.userAgent;
+    u.msg = d.message;
+
+    if (d.allowed) {
+        u.allowed++;
+        u.until = 0;
+    } else {
+        u.blocked++;
+        u.until = u.time + d.retryAfterMs;
     }
 
-    static String esc(String s) {
-        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"").replaceAll("\\p{Cntrl}", "");
+    render();
+    return d.allowed;
+}
+
+// 5. Buttons
+document.getElementById("send").onclick = function () {
+    sendRequest(users[active]);
+};
+
+document.getElementById("spam").onclick = async function () {
+    var u = users[active];
+    u.busy = true;
+
+    for (var n = 0; n < 10; n++) {
+        var allowed = await sendRequest(u);
+        if (!allowed) break;
+        await new Promise(function (r) { setTimeout(r, 120); });
+    }
+
+    u.busy = false;
+    render();
+};
+
+render();
+</script>
+</body>
+</html>
+""";
+
+    // Send a response to the browser
+    static void send(HttpExchange ex, int code, String type, String body) throws Exception {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", type);
+        ex.sendResponseHeaders(code, bytes.length);
+
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // Make text safe to put inside JSON
+    static String clean(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replaceAll("\\p{Cntrl}", "");
     }
 
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
+
         TokenBucketRateLimiter limiter = new TokenBucketRateLimiter(CAPACITY, REFILL_MS);
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
 
-        String page = PAGE.replace("__CAP__", "" + CAPACITY)
-                          .replace("__REFILL__", "" + REFILL_MS)
-                          .replace("__SEC__", "" + REFILL_MS / 1000);
+        String page = PAGE
+                .replace("__CAP__", String.valueOf(CAPACITY))
+                .replace("__REFILL__", String.valueOf(REFILL_MS))
+                .replace("__SEC__", String.valueOf(REFILL_MS / 1000));
 
+        // Home page
         server.createContext("/", ex -> send(ex, 200, "text/html; charset=UTF-8", page));
 
+        // Rate limit check
         server.createContext("/allow", ex -> {
-            String q = ex.getRequestURI().getQuery();
-            String id = (q != null && q.startsWith("clientId=")) ? q.substring(9).replaceAll("[^a-zA-Z0-9_-]", "") : "";
-            if (id.isEmpty()) id = "anonymous";
-            if (id.length() > 40) id = id.substring(0, 40);
+            // 1. Read clientId from the URL
+            String query = ex.getRequestURI().getQuery();
+            String id = "anonymous";
+            if (query != null && query.startsWith("clientId=")) {
+                id = query.substring(9).replaceAll("[^a-zA-Z0-9_-]", "");
+                if (id.isEmpty()) id = "anonymous";
+            }
 
-            // Render is behind a proxy, so X-Forwarded-For comes first
+            // 2. Client details (Render is behind a proxy, so check X-Forwarded-For first)
             String ip = ex.getRequestHeaders().getFirst("X-Forwarded-For");
-            ip = (ip != null && !ip.isEmpty()) ? ip.split(",")[0].trim()
-                                               : ex.getRemoteAddress().getAddress().getHostAddress();
-            String ua = ex.getRequestHeaders().getFirst("User-Agent");
+            if (ip != null && !ip.isEmpty()) {
+                ip = ip.split(",")[0].trim();
+            } else {
+                ip = ex.getRemoteAddress().getAddress().getHostAddress();
+            }
+            String browser = ex.getRequestHeaders().getFirst("User-Agent");
 
+            // 3. Ask the token bucket
             TokenBucketRateLimiter.Result r = limiter.tryAcquire(id);
-            String msg = r.allowed() ? "Request allowed" : "Too many requests. Wait " + r.waitMs() / 1000.0 + " seconds";
-            String body = "{\"allowed\":" + r.allowed() + ",\"remaining\":" + r.remaining()
-                    + ",\"retryAfterMs\":" + r.waitMs() + ",\"ip\":\"" + esc(ip)
-                    + "\",\"userAgent\":\"" + esc(ua) + "\",\"message\":\"" + msg + "\"}";
-            if (!r.allowed()) ex.getResponseHeaders().set("Retry-After", "" + (r.waitMs() + 999) / 1000);
-            send(ex, r.allowed() ? 200 : 429, "application/json; charset=UTF-8", body);
+
+            // 4. Build the JSON response
+            String message = r.allowed()
+                    ? "Request allowed"
+                    : "Too many requests. Wait " + r.waitMs() / 1000.0 + " seconds";
+
+            String body = "{"
+                    + "\"allowed\":" + r.allowed() + ","
+                    + "\"remaining\":" + r.remaining() + ","
+                    + "\"retryAfterMs\":" + r.waitMs() + ","
+                    + "\"ip\":\"" + clean(ip) + "\","
+                    + "\"userAgent\":\"" + clean(browser) + "\","
+                    + "\"message\":\"" + message + "\""
+                    + "}";
+
+            // 5. 200 if allowed, 429 if blocked
+            int code = r.allowed() ? 200 : 429;
+            send(ex, code, "application/json; charset=UTF-8", body);
         });
 
-        server.setExecutor(Executors.newCachedThreadPool());
+        // Handle many users at the same time
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
         server.start();
         System.out.println("Running on port " + port);
     }
