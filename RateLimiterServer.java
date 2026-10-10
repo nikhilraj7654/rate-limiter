@@ -47,6 +47,14 @@ pre { background: #f5f5f5; padding: 10px; border-radius: 8px; white-space: pre-w
 
 <h2>Token Bucket Rate Limiter</h2>
 <p>Each user has __CAP__ tokens. One token comes back every __SEC__ seconds. Click a user to see details.</p>
+    
+<div id ="clients"></div>
+<button id="send">Send Request</button>
+<button id="spam">Spam 10</button>
+<h3 id="msg"></h3>
+<pre id="details"></pre>    
+
+    
 
 <div id="users"></div>
 <button id="send">Send Request</button>
@@ -59,12 +67,14 @@ var CAP = __CAP__;
 var REFILL = __REFILL__;
 var active = 0;
 var sid = Date.now();
+var clients = [];    
 var users = [];
 var cards = [];
 
 // 1. Create 3 users. Each has its own state.
 for (let i = 0; i < 3; i++) {
     users.push({
+        id: "clients" + (i + 1) + "-" + sid,
         id: "user" + (i + 1) + "-" + sid,
         tokens: CAP,
         time: Date.now(),
@@ -116,6 +126,7 @@ function render() {
     });
 
     // message and buttons for the active user
+    var u = clients[active];
     var u = users[active];
     var wait = u.until - now;
     var disabled = u.busy || wait > 0;
