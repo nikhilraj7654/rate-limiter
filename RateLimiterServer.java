@@ -168,14 +168,18 @@ render();
 </html>
 """;
 
-    // Send a response to the browser
-    static void send(HttpExchange ex, int code, String type, String body) throws Exception {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", type);
-        ex.sendResponseHeaders(code, bytes.length);
+    // Send a response to the browser (handles its own exceptions)
+    static void send(HttpExchange ex, int code, String type, String body) {
+        try {
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", type);
+            ex.sendResponseHeaders(code, bytes.length);
 
-        try (OutputStream os = ex.getResponseBody()) {
-            os.write(bytes);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(bytes);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
         }
     }
 
