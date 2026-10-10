@@ -41,7 +41,8 @@ body { font-family: Arial; max-width: 650px; margin: 30px auto; padding: 0 16px;
 .on { border-color: #2b6cb0; background: #f0f6ff; }
 .ok { color: #11743a; }
 .no { color: #b42318; }
-button { padding: 10px 16px; }
+button { padding: 10px 14px; margin: 2px 2px 2px 0; }
+button:disabled { opacity: .5; cursor: not-allowed; }
 pre { background: #f5f5f5; padding: 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; }
 </style>
 </head>
@@ -62,6 +63,10 @@ function clock(t) {
     return t ? new Date(t).toLocaleTimeString() : "-";
 }
 
+function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+}
+
 // Current tokens = last known tokens + refill since last request
 function tokens(u) {
     var refilled = (Date.now() - u.time) / REFILL;
@@ -77,8 +82,10 @@ function createGroup(title, label, prefix) {
     box.innerHTML =
         "<h3>" + title + "</h3>" +
         "<div class='row'></div>" +
-        "<button class='send'>Send Request</button> " +
-        "<button class='spam'>Spam 10</button>" +
+        "<button class='send'>Send Request</button>" +
+        "<button class='spamAllow'>Spam Allow 10</button>" +
+        "<button class='getDet'>Get Details</button>" +
+        "<button class='spamDet'>Spam Details 10</button>" +
         "<h4 class='msg'></h4>" +
         "<pre class='details'></pre>";
     document.getElementById("app").appendChild(box);
@@ -86,7 +93,9 @@ function createGroup(title, label, prefix) {
     g.row = box.querySelector(".row");
     g.msg = box.querySelector(".msg");
     g.sendBtn = box.querySelector(".send");
-    g.spamBtn = box.querySelector(".spam");
+    g.spamAllowBtn = box.querySelector(".spamAllow");
+    g.getDetBtn = box.querySelector(".getDet");
+    g.spamDetBtn = box.querySelector(".spamDet");
     g.details = box.querySelector(".details");
 
     // 3 items, each with its own state and its own client id
@@ -98,14 +107,16 @@ function createGroup(title, label, prefix) {
             until: 0,
             status: "-",
             msg: "Ready",
-            busy: false,
-            server: null      // data from the /details API
+            ok: 0,
+            no: 0,
+            run: 0,          // changes when a new spam starts, so the old spam stops
+            mode: "",        // "allow" or "details" while a spam is running
+            server: null     // data from the /details API
         });
 
         var card = document.createElement("div");
         card.onclick = function () {
             g.active = i;
-            loadDetails(g.items[i]);
             render();
         };
         g.row.appendChild(card);
@@ -114,27 +125,51 @@ function createGroup(title, label, prefix) {
 
     // Buttons work only for the selected item of this group
     g.sendBtn.onclick = function () {
-        sendRequest(g.items[g.active]);
-    };
-
-    g.spamBtn.onclick = async function () {
         var u = g.items[g.active];
-        u.busy = true;
-
-        for (var n = 0; n < 10; n++) {
-            var allowed = await sendRequest(u);
-            if (!allowed) break;
-            await new Promise(function (r) { setTimeout(r, 120); });
-        }
-
-        u.busy = false;
-        render();
+        u.run++;                  // stop any running spam
+        u.mode = "";
+        callAllow(u);
+    };
+    g.getDetBtn.onclick = function () {
+        var u = g.items[g.active];
+        u.run++;
+        u.mode = "";
+        callDetails(u);
+    };
+    g.spamAllowBtn.onclick = function () {
+        spam(g.items[g.active], "allow");
+    };
+    g.spamDetBtn.onclick = function () {
+        spam(g.items[g.active], "details");
     };
 
     groups.push(g);
 }
 
-// 2. Draw one group from its data
+// 2. Spam: a new spam stops the old one (because u.run changes)
+async function spam(u, kind) {
+    u.run++;
+    var mine = u.run;
+    u.mode = kind;
+
+    for (var n = 0; n < 10; n++) {
+        if (mine !== u.run) return;           // another button was pressed, stop here
+
+        if (kind == "allow") {
+            var allowed = await callAllow(u);
+            if (!allowed) break;              // blocked, stop
+        } else {
+            await callDetails(u);
+        }
+
+        await sleep(120);
+    }
+
+    if (mine === u.run) u.mode = "";
+    render();
+}
+
+// 3. Draw one group from its data
 function renderGroup(g) {
     var now = Date.now();
 
@@ -144,37 +179,41 @@ function renderGroup(g) {
         var state = wait > 0
             ? "<span class='no'>Blocked " + (wait / 1000).toFixed(1) + " s</span>"
             : "<span class='ok'>Ready</span>";
-        var s = u.server;
 
         g.cards[i].className = (i == g.active) ? "card on" : "card";
         g.cards[i].innerHTML =
             "<b>" + g.label + " " + (i + 1) + "</b><br>" +
             "Tokens: " + Math.floor(tokens(u) + 0.001) + "/" + CAP + "<br>" +
             state + "<br>" +
-            "<small>Allowed " + (s ? s.allowed : 0) + " | Blocked " + (s ? s.blocked : 0) + "</small>";
+            "<small>Allowed " + u.ok + " | Blocked " + u.no + "</small>";
     });
 
     // message and buttons for the selected item
     var u = g.items[g.active];
     var wait = u.until - now;
-    var disabled = u.busy || wait > 0;
 
-    g.msg.textContent = wait > 0 ? "Please wait " + (wait / 1000).toFixed(1) + " s" : u.msg;
-    g.sendBtn.disabled = disabled;
-    g.spamBtn.disabled = disabled;
+    if (u.mode == "allow") g.msg.textContent = "Running: Spam Allow...";
+    else if (u.mode == "details") g.msg.textContent = "Running: Spam Details...";
+    else g.msg.textContent = wait > 0 ? "Please wait " + (wait / 1000).toFixed(1) + " s" : u.msg;
 
-    // details panel (data comes from the /details API)
-    var s = u.server;
+    // only the allow buttons stop when blocked, details buttons always work
+    g.sendBtn.disabled = wait > 0;
+    g.spamAllowBtn.disabled = wait > 0;
+
+    // details panel
     var lines = [
         "Client ID: " + u.id,
         "Limit: " + CAP + " requests, 1 token comes back every " + (REFILL / 1000) + " s",
-        "Tokens now: " + tokens(u).toFixed(2) + " / " + CAP
+        "Tokens now: " + tokens(u).toFixed(2) + " / " + CAP,
+        "Last allow HTTP status: " + u.status
     ];
 
+    var s = u.server;
     if (s) {
+        lines.push("");
+        lines.push("From /details API:");
         lines.push("Total requests: " + s.total);
         lines.push("Allowed: " + s.allowed + "   Blocked: " + s.blocked);
-        lines.push("Last HTTP status: " + u.status);
         lines.push("IP (seen by server): " + s.ip);
         lines.push("Browser (seen by server): " + s.userAgent);
         lines.push("First seen: " + clock(s.firstSeen));
@@ -185,7 +224,8 @@ function renderGroup(g) {
             lines.push(clock(h.time) + "  |  HTTP " + h.status + "  |  tokens left " + h.remaining);
         });
     } else {
-        lines.push("No requests sent yet.");
+        lines.push("");
+        lines.push("Press Get Details or Spam Details to load server data.");
     }
 
     g.details.textContent = lines.join("\\n");
@@ -195,17 +235,8 @@ function render() {
     groups.forEach(renderGroup);
 }
 
-// 3. API 2: get the saved details of one client from the server
-async function loadDetails(u) {
-    var res = await fetch("/details?clientId=" + u.id);
-    if (res.ok) {
-        u.server = await res.json();
-    }
-    render();
-}
-
-// 4. API 1: send one request for one client
-async function sendRequest(u) {
+// 4. API 1: one /allow call. Does NOT call /details.
+async function callAllow(u) {
     var res = await fetch("/allow?clientId=" + u.id);
     var d = await res.json();
 
@@ -215,16 +246,32 @@ async function sendRequest(u) {
     u.msg = d.message;
 
     if (d.allowed) {
+        u.ok++;
         u.until = 0;
     } else {
+        u.no++;
         u.until = u.time + d.retryAfterMs;
     }
 
-    await loadDetails(u);
+    render();
     return d.allowed;
 }
 
-// 5. Build both groups
+// 5. API 2: one /details call. Does NOT call /allow.
+async function callDetails(u) {
+    var res = await fetch("/details?clientId=" + u.id);
+
+    if (res.ok) {
+        u.server = await res.json();
+    } else {
+        u.msg = "No details yet. Send a request first.";
+    }
+
+    render();
+    return res.ok;
+}
+
+// 6. Build both groups
 createGroup("Users", "User", "user");
 createGroup("Clients", "Client", "client");
 
@@ -344,25 +391,4 @@ render();
                 body = "{"
                         + "\"clientId\":\"" + id + "\","
                         + "\"limit\":" + CAPACITY + ","
-                        + "\"refillSeconds\":" + (REFILL_MS / 1000) + ","
-                        + "\"remaining\":" + c.remaining + ","
-                        + "\"total\":" + (c.allowed + c.blocked) + ","
-                        + "\"allowed\":" + c.allowed + ","
-                        + "\"blocked\":" + c.blocked + ","
-                        + "\"ip\":\"" + clean(c.ip) + "\","
-                        + "\"userAgent\":\"" + clean(c.browser) + "\","
-                        + "\"firstSeen\":" + c.firstSeen + ","
-                        + "\"lastRequest\":" + c.lastRequest + ","
-                        + "\"history\":[" + String.join(",", c.history) + "]"
-                        + "}";
-            }
-
-            send(ex, 200, "application/json; charset=UTF-8", body);
-        });
-
-        // Handle many users at the same time
-        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
-        server.start();
-        System.out.println("Running on port " + port);
-    }
-}
+                        + "\"refillSeconds\":"
