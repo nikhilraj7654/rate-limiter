@@ -2,66 +2,73 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class TokenBucketRateLimiter {
 
-    private final ConcurrentHashMap<String, Bucket> clientBuckets = new ConcurrentHashMap<>();
+    public static class Result {
+        public final boolean allowed;
+        public final int remaining;
+        public final double tokens;
+        public final long retryAfterMs;
 
-    private final int maxTokens;
-    private final long refillIntervalMillis;
-
-    public TokenBucketRateLimiter(int maxTokens, long refillIntervalMillis) {
-        this.maxTokens = maxTokens;
-        this.refillIntervalMillis = refillIntervalMillis;
-    }
-
-    public synchronized boolean allowRequest(String clientId) {
-        Bucket bucket = clientBuckets.computeIfAbsent(clientId, id -> new Bucket(maxTokens, System.currentTimeMillis()));
-
-        refill(bucket);
-
-        if (bucket.tokens > 0) {
-            bucket.tokens--;
-            return true;
-        }
-        return false;
-    }
-
-    private void refill(Bucket bucket) {
-        long now = System.currentTimeMillis();
-        long timeSinceLastRefill = now - bucket.lastRefillTimestamp;
-
-        long tokensToAdd = timeSinceLastRefill / refillIntervalMillis;
-
-        if (tokensToAdd > 0) {
-            bucket.tokens = (int) Math.min(maxTokens, bucket.tokens + tokensToAdd);
-            bucket.lastRefillTimestamp = now;
+        Result(boolean allowed, double tokens, long retryAfterMs) {
+            this.allowed = allowed;
+            this.tokens = tokens;
+            this.remaining = (int) Math.floor(tokens);
+            this.retryAfterMs = retryAfterMs;
         }
     }
 
     private static class Bucket {
-        int tokens;
-        long lastRefillTimestamp;
+        double tokens;
+        long lastRefillMs;
+        volatile long lastAccessMs;
 
-        Bucket(int tokens, long lastRefillTimestamp) {
+        Bucket(double tokens, long now) {
             this.tokens = tokens;
-            this.lastRefillTimestamp = lastRefillTimestamp;
+            this.lastRefillMs = now;
+            this.lastAccessMs = now;
         }
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        TokenBucketRateLimiter limiter = new TokenBucketRateLimiter(3, 1000);
+    private final ConcurrentHashMap<String, Bucket> buckets = new ConcurrentHashMap<>();
+    private final int capacity;
+    private final long refillMsPerToken;
 
-        String client = "user123";
+    // capacity = max tokens, refillMsPerToken = time to add 1 token
+    public TokenBucketRateLimiter(int capacity, long refillMsPerToken) {
+        this.capacity = capacity;
+        this.refillMsPerToken = refillMsPerToken;
+    }
 
-        for (int i = 1; i <= 5; i++) {
-            boolean allowed = limiter.allowRequest(client);
-            System.out.println("Request " + i + " -> " + (allowed ? "ALLOWED" : "REJECTED (rate limit hit)"));
+    public Result tryAcquire(String clientId) {
+        long now = System.currentTimeMillis();
+        Bucket bucket = buckets.computeIfAbsent(clientId, id -> new Bucket(capacity, now));
+
+        synchronized (bucket) {
+            long elapsed = now - bucket.lastRefillMs;
+            if (elapsed > 0) {
+                bucket.tokens = Math.min(capacity, bucket.tokens + (double) elapsed / refillMsPerToken);
+                bucket.lastRefillMs = now;
+            }
+            bucket.lastAccessMs = now;
+
+            if (bucket.tokens >= 1) {
+                bucket.tokens -= 1;
+                return new Result(true, bucket.tokens, 0);
+            }
+            long waitMs = (long) Math.ceil((1 - bucket.tokens) * refillMsPerToken);
+            return new Result(false, bucket.tokens, waitMs);
         }
+    }
 
-        System.out.println("\nWaiting 2 seconds for tokens to refill...\n");
-        Thread.sleep(2000);
+    public boolean allowRequest(String clientId) {
+        return tryAcquire(clientId).allowed;
+    }
 
-        for (int i = 6; i <= 8; i++) {
-            boolean allowed = limiter.allowRequest(client);
-            System.out.println("Request " + i + " -> " + (allowed ? "ALLOWED" : "REJECTED (rate limit hit)"));
-        }
+    public void removeIdle(long idleMs) {
+        long now = System.currentTimeMillis();
+        buckets.entrySet().removeIf(e -> now - e.getValue().lastAccessMs > idleMs);
+    }
+
+    public int activeClients() {
+        return buckets.size();
     }
 }
