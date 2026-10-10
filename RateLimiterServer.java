@@ -3,11 +3,27 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedList;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class RateLimiterServer {
 
     static final int CAPACITY = 5;
     static final long REFILL_MS = 30000;
+
+    // Server keeps the details of every client here
+    static class Client {
+        int allowed = 0;
+        int blocked = 0;
+        long firstSeen = System.currentTimeMillis();
+        long lastRequest = 0;
+        String ip = "-";
+        String browser = "-";
+        String remaining = String.valueOf(CAPACITY);
+        LinkedList<String> history = new LinkedList<>();   // last 10 requests, newest first
+    }
+
+    static final ConcurrentHashMap<String, Client> clients = new ConcurrentHashMap<>();
 
     static final String PAGE = """
 <!DOCTYPE html>
@@ -53,18 +69,16 @@ for (let i = 0; i < 3; i++) {
         tokens: CAP,
         time: Date.now(),
         until: 0,
-        allowed: 0,
-        blocked: 0,
         status: "-",
-        ip: "-",
-        browser: "-",
         msg: "Ready",
-        busy: false
+        busy: false,
+        server: null      // data from the /details API
     });
 
     var card = document.createElement("div");
     card.onclick = function () {
         active = i;
+        loadDetails(users[i]);
         render();
     };
     document.getElementById("users").appendChild(card);
@@ -77,6 +91,10 @@ function tokens(u) {
     return Math.min(CAP, u.tokens + refilled);
 }
 
+function clock(t) {
+    return t ? new Date(t).toLocaleTimeString() : "-";
+}
+
 // 3. Draw everything from the users array
 function render() {
     var now = Date.now();
@@ -87,12 +105,14 @@ function render() {
         var state = wait > 0
             ? "<span class='no'>Blocked " + (wait / 1000).toFixed(1) + " s</span>"
             : "<span class='ok'>Ready</span>";
+        var s = u.server;
 
         cards[i].className = (i == active) ? "card on" : "card";
         cards[i].innerHTML =
             "<b>User " + (i + 1) + "</b><br>" +
             "Tokens: " + Math.floor(tokens(u) + 0.001) + "/" + CAP + "<br>" +
-            state;
+            state + "<br>" +
+            "<small>Allowed " + (s ? s.allowed : 0) + " | Blocked " + (s ? s.blocked : 0) + "</small>";
     });
 
     // message and buttons for the active user
@@ -105,21 +125,47 @@ function render() {
     document.getElementById("send").disabled = disabled;
     document.getElementById("spam").disabled = disabled;
 
-    // details panel
-    document.getElementById("details").textContent = [
+    // details panel (data comes from the /details API)
+    var s = u.server;
+    var lines = [
         "Client ID: " + u.id,
-        "Tokens: " + tokens(u).toFixed(2) + " / " + CAP,
-        "Allowed: " + u.allowed + "   Blocked: " + u.blocked,
-        "Last HTTP status: " + u.status,
-        "IP (seen by server): " + u.ip,
-        "Browser (seen by server): " + u.browser
-    ].join("\\n");
+        "Limit: " + CAP + " requests, 1 token comes back every " + (REFILL / 1000) + " s",
+        "Tokens now: " + tokens(u).toFixed(2) + " / " + CAP
+    ];
+
+    if (s) {
+        lines.push("Total requests: " + s.total);
+        lines.push("Allowed: " + s.allowed + "   Blocked: " + s.blocked);
+        lines.push("Last HTTP status: " + u.status);
+        lines.push("IP (seen by server): " + s.ip);
+        lines.push("Browser (seen by server): " + s.userAgent);
+        lines.push("First seen: " + clock(s.firstSeen));
+        lines.push("Last request: " + clock(s.lastRequest));
+        lines.push("");
+        lines.push("Last 10 requests (newest first):");
+        s.history.forEach(function (h) {
+            lines.push(clock(h.time) + "  |  HTTP " + h.status + "  |  tokens left " + h.remaining);
+        });
+    } else {
+        lines.push("No requests sent yet.");
+    }
+
+    document.getElementById("details").textContent = lines.join("\\n");
 }
 
 // refresh the screen every 200 ms so countdowns stay live
 setInterval(render, 200);
 
-// 4. Call the backend for one user
+// 4. API 2: get the saved details of one client from the server
+async function loadDetails(u) {
+    var res = await fetch("/details?clientId=" + u.id);
+    if (res.ok) {
+        u.server = await res.json();
+    }
+    render();
+}
+
+// 5. API 1: send one request for one user
 async function sendRequest(u) {
     var res = await fetch("/allow?clientId=" + u.id);
     var d = await res.json();
@@ -127,23 +173,19 @@ async function sendRequest(u) {
     u.time = Date.now();
     u.tokens = d.remaining;
     u.status = res.status;
-    u.ip = d.ip;
-    u.browser = d.userAgent;
     u.msg = d.message;
 
     if (d.allowed) {
-        u.allowed++;
         u.until = 0;
     } else {
-        u.blocked++;
         u.until = u.time + d.retryAfterMs;
     }
 
-    render();
+    await loadDetails(u);
     return d.allowed;
 }
 
-// 5. Buttons
+// 6. Buttons
 document.getElementById("send").onclick = function () {
     sendRequest(users[active]);
 };
@@ -189,6 +231,17 @@ render();
         return s.replace("\\", "\\\\").replace("\"", "\\\"").replaceAll("\\p{Cntrl}", "");
     }
 
+    // Read clientId from the URL
+    static String getId(HttpExchange ex) {
+        String query = ex.getRequestURI().getQuery();
+        String id = "anonymous";
+        if (query != null && query.startsWith("clientId=")) {
+            id = query.substring(9).replaceAll("[^a-zA-Z0-9_-]", "");
+            if (id.isEmpty()) id = "anonymous";
+        }
+        return id;
+    }
+
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
 
@@ -203,17 +256,11 @@ render();
         // Home page
         server.createContext("/", ex -> send(ex, 200, "text/html; charset=UTF-8", page));
 
-        // Rate limit check
+        // API 1: rate limit check (uses a token)
         server.createContext("/allow", ex -> {
-            // 1. Read clientId from the URL
-            String query = ex.getRequestURI().getQuery();
-            String id = "anonymous";
-            if (query != null && query.startsWith("clientId=")) {
-                id = query.substring(9).replaceAll("[^a-zA-Z0-9_-]", "");
-                if (id.isEmpty()) id = "anonymous";
-            }
+            String id = getId(ex);
 
-            // 2. Client details (Render is behind a proxy, so check X-Forwarded-For first)
+            // Client details (Render is behind a proxy, so check X-Forwarded-For first)
             String ip = ex.getRequestHeaders().getFirst("X-Forwarded-For");
             if (ip != null && !ip.isEmpty()) {
                 ip = ip.split(",")[0].trim();
@@ -222,10 +269,26 @@ render();
             }
             String browser = ex.getRequestHeaders().getFirst("User-Agent");
 
-            // 3. Ask the token bucket
+            // Ask the token bucket
             TokenBucketRateLimiter.Result r = limiter.tryAcquire(id);
+            int code = r.allowed() ? 200 : 429;
 
-            // 4. Build the JSON response
+            // Save this request in the client's record
+            Client c = clients.computeIfAbsent(id, k -> new Client());
+            synchronized (c) {
+                if (r.allowed()) c.allowed++; else c.blocked++;
+                c.lastRequest = System.currentTimeMillis();
+                c.ip = ip;
+                c.browser = browser == null ? "-" : browser;
+                c.remaining = String.valueOf(r.remaining());
+
+                c.history.addFirst("{\"time\":" + c.lastRequest
+                        + ",\"status\":" + code
+                        + ",\"remaining\":" + c.remaining + "}");
+                if (c.history.size() > 10) c.history.removeLast();
+            }
+
+            // Build the JSON response
             String message = r.allowed()
                     ? "Request allowed"
                     : "Too many requests. Wait " + r.waitMs() / 1000.0 + " seconds";
@@ -234,14 +297,41 @@ render();
                     + "\"allowed\":" + r.allowed() + ","
                     + "\"remaining\":" + r.remaining() + ","
                     + "\"retryAfterMs\":" + r.waitMs() + ","
-                    + "\"ip\":\"" + clean(ip) + "\","
-                    + "\"userAgent\":\"" + clean(browser) + "\","
                     + "\"message\":\"" + message + "\""
                     + "}";
 
-            // 5. 200 if allowed, 429 if blocked
-            int code = r.allowed() ? 200 : 429;
             send(ex, code, "application/json; charset=UTF-8", body);
+        });
+
+        // API 2: client details (does NOT use a token)
+        server.createContext("/details", ex -> {
+            String id = getId(ex);
+            Client c = clients.get(id);
+
+            if (c == null) {
+                send(ex, 404, "application/json; charset=UTF-8", "{\"message\":\"Client not found\"}");
+                return;
+            }
+
+            String body;
+            synchronized (c) {
+                body = "{"
+                        + "\"clientId\":\"" + id + "\","
+                        + "\"limit\":" + CAPACITY + ","
+                        + "\"refillSeconds\":" + (REFILL_MS / 1000) + ","
+                        + "\"remaining\":" + c.remaining + ","
+                        + "\"total\":" + (c.allowed + c.blocked) + ","
+                        + "\"allowed\":" + c.allowed + ","
+                        + "\"blocked\":" + c.blocked + ","
+                        + "\"ip\":\"" + clean(c.ip) + "\","
+                        + "\"userAgent\":\"" + clean(c.browser) + "\","
+                        + "\"firstSeen\":" + c.firstSeen + ","
+                        + "\"lastRequest\":" + c.lastRequest + ","
+                        + "\"history\":[" + String.join(",", c.history) + "]"
+                        + "}";
+            }
+
+            send(ex, 200, "application/json; charset=UTF-8", body);
         });
 
         // Handle many users at the same time
