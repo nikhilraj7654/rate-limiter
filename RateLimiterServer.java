@@ -33,8 +33,10 @@ public class RateLimiterServer {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Rate Limiter</title>
 <style>
-body { font-family: Arial; max-width: 600px; margin: 30px auto; padding: 0 16px; }
-#users { display: flex; gap: 10px; margin-bottom: 12px; }
+body { font-family: Arial; max-width: 650px; margin: 30px auto; padding: 0 16px; }
+.group { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-bottom: 20px; }
+.group h3 { margin: 0 0 10px; }
+.row { display: flex; gap: 10px; margin-bottom: 12px; }
 .card { flex: 1; border: 2px solid #ccc; border-radius: 10px; padding: 10px; cursor: pointer; }
 .on { border-color: #2b6cb0; background: #f0f6ff; }
 .ok { color: #11743a; }
@@ -46,95 +48,120 @@ pre { background: #f5f5f5; padding: 10px; border-radius: 8px; white-space: pre-w
 <body>
 
 <h2>Token Bucket Rate Limiter</h2>
-<p>Each user has __CAP__ tokens. One token comes back every __SEC__ seconds. Click a user to see details.</p>
-    
-<div id ="clients"></div>
-<button id="send">Send Request</button>
-<button id="spam">Spam 10</button>
-<h3 id="msg"></h3>
-<pre id="details"></pre>    
+<p>Each user and each client has __CAP__ tokens. One token comes back every __SEC__ seconds. Select one and click a button. Nothing runs by itself.</p>
 
-    
-
-<div id="users"></div>
-<button id="send">Send Request</button>
-<button id="spam">Spam 10</button>
-<h3 id="msg"></h3>
-<pre id="details"></pre>
+<div id="app"></div>
 
 <script>
 var CAP = __CAP__;
 var REFILL = __REFILL__;
-var active = 0;
 var sid = Date.now();
-var clients = [];    
-var users = [];
-var cards = [];
-
-// 1. Create 3 users. Each has its own state.
-for (let i = 0; i < 3; i++) {
-    users.push({
-        id: "clients" + (i + 1) + "-" + sid,
-        id: "user" + (i + 1) + "-" + sid,
-        tokens: CAP,
-        time: Date.now(),
-        until: 0,
-        status: "-",
-        msg: "Ready",
-        busy: false,
-        server: null      // data from the /details API
-    });
-
-    var card = document.createElement("div");
-    card.onclick = function () {
-        active = i;
-        loadDetails(users[i]);
-        render();
-    };
-    document.getElementById("users").appendChild(card);
-    cards.push(card);
-}
-
-// 2. Current tokens = last known tokens + refill since last request
-function tokens(u) {
-    var refilled = (Date.now() - u.time) / REFILL;
-    return Math.min(CAP, u.tokens + refilled);
-}
+var groups = [];
 
 function clock(t) {
     return t ? new Date(t).toLocaleTimeString() : "-";
 }
 
-// 3. Draw everything from the users array
-function render() {
+// Current tokens = last known tokens + refill since last request
+function tokens(u) {
+    var refilled = (Date.now() - u.time) / REFILL;
+    return Math.min(CAP, u.tokens + refilled);
+}
+
+// 1. Create one group (3 cards + buttons + details). Used for Users and for Clients.
+function createGroup(title, label, prefix) {
+    var g = { label: label, active: 0, items: [], cards: [] };
+
+    var box = document.createElement("div");
+    box.className = "group";
+    box.innerHTML =
+        "<h3>" + title + "</h3>" +
+        "<div class='row'></div>" +
+        "<button class='send'>Send Request</button> " +
+        "<button class='spam'>Spam 10</button>" +
+        "<h4 class='msg'></h4>" +
+        "<pre class='details'></pre>";
+    document.getElementById("app").appendChild(box);
+
+    g.row = box.querySelector(".row");
+    g.msg = box.querySelector(".msg");
+    g.sendBtn = box.querySelector(".send");
+    g.spamBtn = box.querySelector(".spam");
+    g.details = box.querySelector(".details");
+
+    // 3 items, each with its own state and its own client id
+    for (let i = 0; i < 3; i++) {
+        g.items.push({
+            id: prefix + (i + 1) + "-" + sid,
+            tokens: CAP,
+            time: Date.now(),
+            until: 0,
+            status: "-",
+            msg: "Ready",
+            busy: false,
+            server: null      // data from the /details API
+        });
+
+        var card = document.createElement("div");
+        card.onclick = function () {
+            g.active = i;
+            loadDetails(g.items[i]);
+            render();
+        };
+        g.row.appendChild(card);
+        g.cards.push(card);
+    }
+
+    // Buttons work only for the selected item of this group
+    g.sendBtn.onclick = function () {
+        sendRequest(g.items[g.active]);
+    };
+
+    g.spamBtn.onclick = async function () {
+        var u = g.items[g.active];
+        u.busy = true;
+
+        for (var n = 0; n < 10; n++) {
+            var allowed = await sendRequest(u);
+            if (!allowed) break;
+            await new Promise(function (r) { setTimeout(r, 120); });
+        }
+
+        u.busy = false;
+        render();
+    };
+
+    groups.push(g);
+}
+
+// 2. Draw one group from its data
+function renderGroup(g) {
     var now = Date.now();
 
     // cards
-    users.forEach(function (u, i) {
+    g.items.forEach(function (u, i) {
         var wait = u.until - now;
         var state = wait > 0
             ? "<span class='no'>Blocked " + (wait / 1000).toFixed(1) + " s</span>"
             : "<span class='ok'>Ready</span>";
         var s = u.server;
 
-        cards[i].className = (i == active) ? "card on" : "card";
-        cards[i].innerHTML =
-            "<b>User " + (i + 1) + "</b><br>" +
+        g.cards[i].className = (i == g.active) ? "card on" : "card";
+        g.cards[i].innerHTML =
+            "<b>" + g.label + " " + (i + 1) + "</b><br>" +
             "Tokens: " + Math.floor(tokens(u) + 0.001) + "/" + CAP + "<br>" +
             state + "<br>" +
             "<small>Allowed " + (s ? s.allowed : 0) + " | Blocked " + (s ? s.blocked : 0) + "</small>";
     });
 
-    // message and buttons for the active user
-    var u = clients[active];
-    var u = users[active];
+    // message and buttons for the selected item
+    var u = g.items[g.active];
     var wait = u.until - now;
     var disabled = u.busy || wait > 0;
 
-    document.getElementById("msg").textContent =
-        wait > 0 ? "Please wait " + (wait / 1000).toFixed(1) + " s" : u.msg;
-    document.getElementById("send").disabled = disabled;
-    document.getElementById("spam").disabled = disabled;
+    g.msg.textContent = wait > 0 ? "Please wait " + (wait / 1000).toFixed(1) + " s" : u.msg;
+    g.sendBtn.disabled = disabled;
+    g.spamBtn.disabled = disabled;
 
     // details panel (data comes from the /details API)
     var s = u.server;
@@ -161,13 +188,14 @@ function render() {
         lines.push("No requests sent yet.");
     }
 
-    document.getElementById("details").textContent = lines.join("\\n");
+    g.details.textContent = lines.join("\\n");
 }
 
-// refresh the screen every 200 ms so countdowns stay live
-setInterval(render, 200);
+function render() {
+    groups.forEach(renderGroup);
+}
 
-// 4. API 2: get the saved details of one client from the server
+// 3. API 2: get the saved details of one client from the server
 async function loadDetails(u) {
     var res = await fetch("/details?clientId=" + u.id);
     if (res.ok) {
@@ -176,7 +204,7 @@ async function loadDetails(u) {
     render();
 }
 
-// 5. API 1: send one request for one user
+// 4. API 1: send one request for one client
 async function sendRequest(u) {
     var res = await fetch("/allow?clientId=" + u.id);
     var d = await res.json();
@@ -196,25 +224,12 @@ async function sendRequest(u) {
     return d.allowed;
 }
 
-// 6. Buttons
-document.getElementById("send").onclick = function () {
-    sendRequest(users[active]);
-};
+// 5. Build both groups
+createGroup("Users", "User", "user");
+createGroup("Clients", "Client", "client");
 
-document.getElementById("spam").onclick = async function () {
-    var u = users[active];
-    u.busy = true;
-
-    for (var n = 0; n < 10; n++) {
-        var allowed = await sendRequest(u);
-        if (!allowed) break;
-        await new Promise(function (r) { setTimeout(r, 120); });
-    }
-
-    u.busy = false;
-    render();
-};
-
+// refresh the screen every 200 ms so countdowns stay live
+setInterval(render, 200);
 render();
 </script>
 </body>
@@ -279,75 +294,3 @@ render();
                 ip = ex.getRemoteAddress().getAddress().getHostAddress();
             }
             String browser = ex.getRequestHeaders().getFirst("User-Agent");
-
-            // Ask the token bucket
-            TokenBucketRateLimiter.Result r = limiter.tryAcquire(id);
-            int code = r.allowed() ? 200 : 429;
-
-            // Save this request in the client's record
-            Client c = clients.computeIfAbsent(id, k -> new Client());
-            synchronized (c) {
-                if (r.allowed()) c.allowed++; else c.blocked++;
-                c.lastRequest = System.currentTimeMillis();
-                c.ip = ip;
-                c.browser = browser == null ? "-" : browser;
-                c.remaining = String.valueOf(r.remaining());
-
-                c.history.addFirst("{\"time\":" + c.lastRequest
-                        + ",\"status\":" + code
-                        + ",\"remaining\":" + c.remaining + "}");
-                if (c.history.size() > 10) c.history.removeLast();
-            }
-
-            // Build the JSON response
-            String message = r.allowed()
-                    ? "Request allowed"
-                    : "Too many requests. Wait " + r.waitMs() / 1000.0 + " seconds";
-
-            String body = "{"
-                    + "\"allowed\":" + r.allowed() + ","
-                    + "\"remaining\":" + r.remaining() + ","
-                    + "\"retryAfterMs\":" + r.waitMs() + ","
-                    + "\"message\":\"" + message + "\""
-                    + "}";
-
-            send(ex, code, "application/json; charset=UTF-8", body);
-        });
-
-        // API 2: client details (does NOT use a token)
-        server.createContext("/details", ex -> {
-            String id = getId(ex);
-            Client c = clients.get(id);
-
-            if (c == null) {
-                send(ex, 404, "application/json; charset=UTF-8", "{\"message\":\"Client not found\"}");
-                return;
-            }
-
-            String body;
-            synchronized (c) {
-                body = "{"
-                        + "\"clientId\":\"" + id + "\","
-                        + "\"limit\":" + CAPACITY + ","
-                        + "\"refillSeconds\":" + (REFILL_MS / 1000) + ","
-                        + "\"remaining\":" + c.remaining + ","
-                        + "\"total\":" + (c.allowed + c.blocked) + ","
-                        + "\"allowed\":" + c.allowed + ","
-                        + "\"blocked\":" + c.blocked + ","
-                        + "\"ip\":\"" + clean(c.ip) + "\","
-                        + "\"userAgent\":\"" + clean(c.browser) + "\","
-                        + "\"firstSeen\":" + c.firstSeen + ","
-                        + "\"lastRequest\":" + c.lastRequest + ","
-                        + "\"history\":[" + String.join(",", c.history) + "]"
-                        + "}";
-            }
-
-            send(ex, 200, "application/json; charset=UTF-8", body);
-        });
-
-        // Handle many users at the same time
-        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
-        server.start();
-        System.out.println("Running on port " + port);
-    }
-}
