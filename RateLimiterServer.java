@@ -22,6 +22,7 @@ public class RateLimiterServer {
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
 
             exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
             exchange.sendResponseHeaders(allowed ? 200 : 429, bytes.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(bytes);
